@@ -17,11 +17,19 @@ using System.Windows.Forms;
 using FFmpeg.NET;
 using Microsoft.VisualBasic.FileIO;
 using System.Text.Json;
+using System.Security.Cryptography;
 
 namespace DOIMAGE
 {
     public partial class Form1 : Form
     {
+        private const double WEIGHT_VISUAL_PHASH = 0.4;
+        private const double WEIGHT_VISUAL_AHASH = 0.2;
+        private const double WEIGHT_AUDIO = 0.3;
+        private const double WEIGHT_COLOR_HISTOGRAM = 0.1;
+        private const double SIMILARITY_THRESHOLD = 0.75; // Overall threshold to consider as duplicate
+        private const int PHASH_HAMMING_DISTANCE_THRESHOLD = 5;
+        private const int MIN_SIMILAR_PHASH_FRAMES = 3; // Min number of pHash frames that need to be similar
 
         public Form1()
         {
@@ -222,6 +230,123 @@ namespace DOIMAGE
             }
         }
 
+        private async Task<string> ExtractColorHistogramsAsync(string videoPath, int frameCount)
+        {
+            var allFrameHistograms = new StringBuilder();
+            var tempFilesToDelete = new List<string>();
+
+            try
+            {
+                var inputFile = new MediaFile(videoPath);
+                var ffmpeg = new Engine(Path.Combine(Application.StartupPath, "ffmpeg.exe"));
+                var metadata = await GetMetaDataWithTimeout(ffmpeg, inputFile, 3000);
+
+                if (metadata == null || metadata.Duration.TotalSeconds <= 0)
+                {
+                    LogerrorMessage($"Could not get metadata or duration for {videoPath} for color histogram.");
+                    return string.Empty;
+                }
+
+                double totalSeconds = metadata.Duration.TotalSeconds;
+                var samplePoints = new List<double>();
+
+                if (frameCount <= 0) frameCount = 1; // Ensure at least one frame if frameCount is invalid
+
+                if (totalSeconds < frameCount) // If video is shorter than requested frames, take one frame per second
+                {
+                    for(int i=0; i < (int)totalSeconds; ++i) samplePoints.Add(i + 0.5); // Mid-point of each second
+                }
+                else // Otherwise, use evenly distributed points like in ExtractFrameHashes
+                {
+                     // Using a more general approach for frameCount
+                    for (int i = 0; i < frameCount; i++)
+                    {
+                        samplePoints.Add(totalSeconds * (i + 1.0) / (frameCount + 1.0));
+                    }
+                }
+                if (!samplePoints.Any()) // Fallback if no sample points generated
+                {
+                     samplePoints.Add(totalSeconds / 2.0); // Middle frame
+                }
+
+
+                foreach (var second in samplePoints)
+                {
+                    var options = new ConversionOptions { Seek = TimeSpan.FromSeconds(second) };
+                    var tempFile = Path.GetTempFileName() + ".jpg";
+                    tempFilesToDelete.Add(tempFile);
+                    var outputFile = new MediaFile(tempFile);
+
+                    await ffmpeg.GetThumbnailAsync(inputFile, outputFile, options);
+
+                    if (!File.Exists(tempFile) || new FileInfo(tempFile).Length == 0)
+                    {
+                        LogerrorMessage($"FFmpeg failed to extract frame at {second}s for {videoPath}. Skipping frame.");
+                        continue;
+                    }
+                    
+                    using (var image = Image.FromFile(tempFile))
+                    using (var bitmap = new Bitmap(image))
+                    {
+                        const int numBins = 4;
+                        int[] rHist = new int[numBins];
+                        int[] gHist = new int[numBins];
+                        int[] bHist = new int[numBins];
+                        int sampledPixels = 0;
+
+                        for (int y = 0; y < bitmap.Height; y += 5)
+                        {
+                            for (int x = 0; x < bitmap.Width; x += 5)
+                            {
+                                Color pixel = bitmap.GetPixel(x, y);
+                                
+                                int rBin = Math.Min(numBins - 1, (pixel.R * numBins) / 256);
+                                int gBin = Math.Min(numBins - 1, (pixel.G * numBins) / 256);
+                                int bBin = Math.Min(numBins - 1, (pixel.B * numBins) / 256);
+
+                                rHist[rBin]++;
+                                gHist[gBin]++;
+                                bHist[bBin]++;
+                                sampledPixels++;
+                            }
+                        }
+
+                        if (sampledPixels == 0) continue; // Avoid division by zero for tiny/empty frames
+
+                        var frameHistString = new StringBuilder();
+                        for(int i=0; i<numBins; ++i) frameHistString.AppendFormat(CultureInfo.InvariantCulture, "{0:F4}{1}", (double)rHist[i]/sampledPixels, i == numBins -1 ? "" : ",");
+                        frameHistString.Append(";");
+                        for(int i=0; i<numBins; ++i) frameHistString.AppendFormat(CultureInfo.InvariantCulture, "{0:F4}{1}", (double)gHist[i]/sampledPixels, i == numBins -1 ? "" : ",");
+                        frameHistString.Append(";");
+                        for(int i=0; i<numBins; ++i) frameHistString.AppendFormat(CultureInfo.InvariantCulture, "{0:F4}{1}", (double)bHist[i]/sampledPixels, i == numBins -1 ? "" : ",");
+
+                        if (allFrameHistograms.Length > 0)
+                        {
+                            allFrameHistograms.Append("|");
+                        }
+                        allFrameHistograms.Append(frameHistString.ToString());
+                    }
+                }
+                return allFrameHistograms.ToString();
+            }
+            catch (Exception ex)
+            {
+                LogerrorMessage($"Error extracting color histograms for {videoPath}: {ex.Message}");
+                return string.Empty;
+            }
+            finally
+            {
+                foreach (var tempFile in tempFilesToDelete)
+                {
+                    if (File.Exists(tempFile))
+                    {
+                        try { File.Delete(tempFile); }
+                        catch (Exception ex) { LogerrorMessage($"Error deleting temp histogram file {tempFile}: {ex.Message}"); }
+                    }
+                }
+            }
+        }
+
         private double[,] ComputeDCT(double[,] pixels)
         {
             int size = 32;
@@ -316,17 +441,69 @@ namespace DOIMAGE
             progressBar.Maximum = videoFiles.Count;
             progressBar.Value = 0;
             lblProgress.Text = "正在分析视频...";
+            
+            int processedCount = 0;
 
-            foreach (var file in videoFiles)
+            List<Task<VideoInfo?>> videoInfoTasks = videoFiles.Select(async file =>
             {
-                var info = await GetVideoInfo(file);
-                if (info != null)
+                VideoInfo? info = null;
+                try
                 {
-                    videoInfos[file] = info;
+                    info = await GetVideoInfo(file); // GetVideoInfo is already async
                 }
-                progressBar.Value++;
-                lblProgress.Text = $"收集视频信息: {progressBar.Value}/{videoFiles.Count}";
-                await Task.Delay(1);
+                catch (Exception ex)
+                {
+                    // Log error for this specific file, prevent it from crashing the whole process
+                    LogerrorMessage($"Error processing file {file} in GetVideoInfo task: {ex.Message}");
+                }
+                finally
+                {
+                    // Thread-safe progress update
+                    int currentProgress = Interlocked.Increment(ref processedCount);
+                    // Ensure UI updates are marshalled to the UI thread
+                    if (this.IsHandleCreated && !this.IsDisposed) 
+                    {
+                        try
+                        {
+                            this.Invoke((Action)(() => {
+                                if (!progressBar.IsDisposed) progressBar.Value = currentProgress;
+                                if (!lblProgress.IsDisposed) lblProgress.Text = $"收集视频信息: {currentProgress}/{videoFiles.Count}";
+                            }));
+                        }
+                        catch (ObjectDisposedException) 
+                        {
+                            // Handle cases where the form or controls might be disposed during async operations
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // Handle cases where Invoke is called on a disposed handle
+                        }
+                    }
+                }
+                return info; 
+            }).ToList();
+
+            VideoInfo?[] results = await Task.WhenAll(videoInfoTasks);
+
+            foreach (var infoResult in results)
+            {
+                if (infoResult != null && !string.IsNullOrEmpty(infoResult.Path)) 
+                {
+                    videoInfos[infoResult.Path] = infoResult;
+                }
+            }
+            
+            if (this.IsHandleCreated && !this.IsDisposed)
+            {
+                 try
+                 {
+                    this.Invoke((Action)(() => {
+                        if (!progressBar.IsDisposed) progressBar.Value = videoFiles.Count; 
+                        if (!lblProgress.IsDisposed) lblProgress.Text = $"信息收集完成: {processedCount}/{videoFiles.Count}";
+                    }));
+                 }
+                 catch (ObjectDisposedException) { /* Ignore if form/controls disposed */ }
+                 catch (InvalidOperationException) { /* Ignore if invoke called on disposed handle */ }
             }
 
             // 保存更新后的缓存
@@ -359,7 +536,83 @@ namespace DOIMAGE
             public string Path { get; set; }
             public long FileSize { get; set; }
             public TimeSpan Duration { get; set; }
-            public List<string> Hashes { get; set; }  // 存储pHash值
+            public List<string> PerceptualHashes { get; set; }  // 存储pHash值
+            public string AudioFingerprint { get; set; }
+            public string ColorHistogram { get; set; }
+            public string AverageHash { get; set; }
+        }
+
+        private async Task<string> ExtractAudioFeaturesAsync(string videoPath)
+        {
+            string tempWavPath = string.Empty;
+            try
+            {
+                tempWavPath = Path.GetTempFileName() + ".wav";
+                string ffmpegPath = Path.Combine(Application.StartupPath, "ffmpeg.exe");
+
+                // Ensure videoPath and tempWavPath are quoted if they contain spaces
+                string arguments = $"-i \"{videoPath}\" -ss 0 -t 60 -vn -acodec pcm_s16le -ar 44100 -ac 1 \"{tempWavPath}\"";
+
+                ProcessStartInfo startInfo = new ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = arguments,
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardError = true
+                };
+
+                using (Process process = new Process { StartInfo = startInfo })
+                {
+                    process.Start();
+                    string errorOutput = await process.StandardError.ReadToEndAsync();
+                    await Task.Run(() => process.WaitForExit()); // Offload waiting to a thread pool thread
+
+                    if (process.ExitCode != 0)
+                    {
+                        LogerrorMessage($"FFmpeg error for {videoPath}: {errorOutput}");
+                        return string.Empty;
+                    }
+                }
+
+                if (!File.Exists(tempWavPath) || new FileInfo(tempWavPath).Length == 0)
+                {
+                    LogerrorMessage($"FFmpeg produced an empty or missing WAV file for {videoPath}.");
+                    return string.Empty;
+                }
+
+                byte[] audioBytes = await File.ReadAllBytesAsync(tempWavPath);
+
+                using (SHA256 sha256 = SHA256.Create())
+                {
+                    byte[] hashBytes = sha256.ComputeHash(audioBytes);
+                    StringBuilder sb = new StringBuilder();
+                    foreach (byte b in hashBytes)
+                    {
+                        sb.Append(b.ToString("x2"));
+                    }
+                    return sb.ToString();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogerrorMessage($"Error extracting audio features for {videoPath}: {ex.Message}");
+                return string.Empty;
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(tempWavPath) && File.Exists(tempWavPath))
+                {
+                    try
+                    {
+                        File.Delete(tempWavPath);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogerrorMessage($"Error deleting temporary WAV file {tempWavPath}: {ex.Message}");
+                    }
+                }
+            }
         }
 
         private async Task<VideoInfo> GetVideoInfo(string videoPath)
@@ -379,7 +632,10 @@ namespace DOIMAGE
                             Path = videoPath,
                             FileSize = cachedInfo.FileSize,
                             Duration = cachedInfo.Duration,
-                            Hashes = cachedInfo.Hashes
+                            PerceptualHashes = cachedInfo.PerceptualHashes,
+                            AudioFingerprint = cachedInfo.AudioFingerprint,
+                            ColorHistogram = cachedInfo.ColorHistogram,
+                            AverageHash = cachedInfo.AverageHash
                         };
                     }
                 }
@@ -395,8 +651,17 @@ namespace DOIMAGE
                     Path = videoPath,
                     FileSize = fileInfo.Length,
                     Duration = metadata.Duration,
-                    Hashes = await ExtractFrameHashes(videoPath, 5)  // 提取5个关键帧的pHash
+                    AudioFingerprint = await ExtractAudioFeaturesAsync(videoPath),
+                    ColorHistogram = await ExtractColorHistogramsAsync(videoPath, 5),   // Extract 5 frames for histogram
+                    // AverageHash will be set from visualFeatures below
                 };
+
+                var visualFeatures = await ExtractFrameHashes(videoPath, 5);
+                info.PerceptualHashes = visualFeatures.Item1;
+                info.AverageHash = visualFeatures.Item2;
+                if (info.PerceptualHashes == null) info.PerceptualHashes = new List<string>(); // Defensive
+                if (info.AverageHash == null) info.AverageHash = string.Empty; // Defensive
+
 
                 // 更新缓存
                 videoCache[videoPath] = new VideoCache
@@ -404,7 +669,10 @@ namespace DOIMAGE
                     FilePath = videoPath,
                     FileSize = fileInfo.Length,
                     Duration = metadata.Duration,
-                    Hashes = info.Hashes,
+                    PerceptualHashes = info.PerceptualHashes,
+                    AudioFingerprint = info.AudioFingerprint,
+                    ColorHistogram = info.ColorHistogram,
+                    AverageHash = info.AverageHash,
                     LastModified = fileInfo.LastWriteTime
                 };
 
@@ -417,15 +685,22 @@ namespace DOIMAGE
             }
         }
 
-        private async Task<List<string>> ExtractFrameHashes(string videoPath, int frameCount)
+        private async Task<Tuple<List<string>, string>> ExtractFrameHashes(string videoPath, int frameCount)
         {
-            var hashes = new List<string>();
+            var perceptualHashes = new List<string>();
+            string representativeAHash = string.Empty;
+            var tempFilesToDelete = new List<string>();
+
             try
             {
                 var inputFile = new MediaFile(videoPath);
                 var ffmpeg = new Engine(Path.Combine(Application.StartupPath, "ffmpeg.exe"));
                 var metadata = await GetMetaDataWithTimeout(ffmpeg, inputFile, 3000);
-                if (metadata == null) return hashes;
+                if (metadata == null || metadata.Duration.TotalSeconds <= 0)
+                {
+                    LogerrorMessage($"Could not get metadata for {videoPath} for frame hash extraction.");
+                    return Tuple.Create(perceptualHashes, representativeAHash);
+                }
 
                 double totalSeconds = metadata.Duration.TotalSeconds;
 
@@ -438,31 +713,58 @@ namespace DOIMAGE
                     totalSeconds * 0.6,  // 60%处
                     totalSeconds * 0.8   // 80%处
                 };
+                
+                // Ensure frameCount matches the number of sample points if fixed, or adjust loop
+                // For this specific implementation, samplePoints.Count is the effective frameCount for pHashes.
+                // The middle frame for aHash will be samplePoints[2] (50% mark).
 
-                foreach (var second in samplePoints)
+                for (int i = 0; i < samplePoints.Count; i++)
                 {
+                    var second = samplePoints[i];
                     var options = new ConversionOptions { Seek = TimeSpan.FromSeconds(second) };
                     var tempFile = Path.GetTempFileName() + ".jpg";
+                    tempFilesToDelete.Add(tempFile);
                     var outputFile = new MediaFile(tempFile);
 
                     await ffmpeg.GetThumbnailAsync(inputFile, outputFile, options);
+                    
+                    if (!File.Exists(tempFile) || new FileInfo(tempFile).Length == 0)
+                    {
+                        LogerrorMessage($"FFmpeg failed to extract frame at {second}s for {videoPath} (ExtractFrameHashes). Skipping frame.");
+                        continue;
+                    }
 
                     using (var image = Image.FromFile(tempFile))
                     {
-                        string hash = CalculatePHash(image);
-                        hashes.Add(hash);
+                        string pHash = CalculatePerceptualHash(image); // Renamed from CalculatePHash
+                        perceptualHashes.Add(pHash);
+
+                        if (i == 2) // Middle frame (50% mark, index 2 for 5 samples)
+                        {
+                            representativeAHash = CalculateAverageHash(image);
+                        }
                     }
-                    try { File.Delete(tempFile); } catch { }
                 }
             }
             catch (Exception ex)
             {
                 LogerrorMessage($"提取帧哈希失败: {videoPath}: {ex.Message}");
             }
-            return hashes;
+            finally
+            {
+                foreach (var tempFile in tempFilesToDelete)
+                {
+                    if (File.Exists(tempFile))
+                    {
+                        try { File.Delete(tempFile); }
+                        catch (Exception exDel) { LogerrorMessage($"Error deleting temp file {tempFile} in ExtractFrameHashes: {exDel.Message}"); }
+                    }
+                }
+            }
+            return Tuple.Create(perceptualHashes, representativeAHash);
         }
 
-        private string CalculatePHash(Image image)
+        private string CalculatePerceptualHash(Image image) // Renamed from CalculatePHash
         {
             // 第一步：缩小尺寸
             using (var resized = new Bitmap(image, new Size(32, 32)))
@@ -534,34 +836,151 @@ namespace DOIMAGE
             return dct;
         }
 
-        private bool AreVideosSimilar(List<string> hashes1, List<string> hashes2)
+        private double CalculatePerceptualHashSimilarity(List<string> pHashes1, List<string> pHashes2)
         {
-            if (hashes1.Count == 0 || hashes2.Count == 0)
-                return false;
-
-            int similarFrames = 0;
-            int requiredSimilarFrames = 3; // 要求至少3帧相似
-
-            foreach (var hash1 in hashes1)
+            if (pHashes1 == null || pHashes2 == null || !pHashes1.Any() || !pHashes2.Any())
             {
-                foreach (var hash2 in hashes2)
+                return 0.0;
+            }
+
+            int similarFramesCount = 0;
+            foreach (var hash1 in pHashes1)
+            {
+                foreach (var hash2 in pHashes2)
                 {
-                    int hammingDistance = CalculateHammingDistance(hash1, hash2);
-                    if (hammingDistance <= 5) // 允许5位不同
+                    if (CalculateHammingDistance(hash1, hash2) <= PHASH_HAMMING_DISTANCE_THRESHOLD)
                     {
-                        similarFrames++;
-                        if (similarFrames >= requiredSimilarFrames)
-                        {
-                            return true;
-                        }
-                        break;
+                        similarFramesCount++;
+                        break; // Count first match for hash1 and move to next hash1
                     }
                 }
             }
 
-            return false;
+            if (similarFramesCount < MIN_SIMILAR_PHASH_FRAMES)
+            {
+                return 0.0;
+            }
+            
+            // Score based on the proportion of matched frames from the perspective of the longer list to normalize.
+            // Or, average of proportions from both lists to be more symmetric.
+            // For now, using the simpler: (number of pairs with Hamming distance <= THRESHOLD) / (max number of hashes in either list).
+            // The loop above counts similar hash1 entries, not total pairs.
+            // Let's re-evaluate the scoring based on "number of pairs... / max number of hashes"
+            // The current similarFramesCount is "number of hashes in pHashes1 that have a match in pHashes2"
+
+            int totalConsideredFrames = Math.Max(pHashes1.Count, pHashes2.Count);
+            if (totalConsideredFrames == 0) return 0.0; // Should be caught by earlier checks
+
+            return (double)similarFramesCount / totalConsideredFrames;
         }
 
+        private double CalculateAverageHashSimilarity(string aHash1, string aHash2)
+        {
+            if (string.IsNullOrEmpty(aHash1) || string.IsNullOrEmpty(aHash2) || aHash1.Length != aHash2.Length)
+            {
+                return 0.0;
+            }
+            if (aHash1.Length == 0) return 0.0; // Avoid division by zero
+
+            int distance = CalculateHammingDistance(aHash1, aHash2);
+            return 1.0 - (double)distance / aHash1.Length;
+        }
+
+        private double CalculateAudioSimilarity(string audioFingerprint1, string audioFingerprint2)
+        {
+            if (string.IsNullOrEmpty(audioFingerprint1) || string.IsNullOrEmpty(audioFingerprint2))
+            {
+                return 0.0;
+            }
+            return audioFingerprint1 == audioFingerprint2 ? 1.0 : 0.0;
+        }
+
+        private double CalculateColorHistogramSimilarity(string chStr1, string chStr2)
+        {
+            if (string.IsNullOrEmpty(chStr1) || string.IsNullOrEmpty(chStr2))
+            {
+                return 0.0;
+            }
+
+            try
+            {
+                string[] frameHistograms1 = chStr1.Split('|');
+                string[] frameHistograms2 = chStr2.Split('|');
+
+                if (frameHistograms1.Length != frameHistograms2.Length || frameHistograms1.Length == 0)
+                {
+                    // If frame counts differ, or no frames, consider not similar in this aspect.
+                    // Alternatively, one could compare only the minimum number of common frames.
+                    return 0.0;
+                }
+
+                double totalSimilarity = 0;
+                int validFramesCompared = 0;
+
+                for (int i = 0; i < frameHistograms1.Length; i++)
+                {
+                    string[] channels1 = frameHistograms1[i].Split(';');
+                    string[] channels2 = frameHistograms2[i].Split(';');
+
+                    if (channels1.Length != 3 || channels2.Length != 3) continue; // Expect R,G,B
+
+                    double frameSimilarity = 0;
+                    int channelsComparedThisFrame = 0;
+
+                    for (int j = 0; j < 3; j++) // R, G, B channels
+                    {
+                        string[] bins1Str = channels1[j].Split(',');
+                        string[] bins2Str = channels2[j].Split(',');
+
+                        if (bins1Str.Length != bins2Str.Length || bins1Str.Length == 0) continue;
+
+                        double[] bins1 = bins1Str.Select(s => double.Parse(s, CultureInfo.InvariantCulture)).ToArray();
+                        double[] bins2 = bins2Str.Select(s => double.Parse(s, CultureInfo.InvariantCulture)).ToArray();
+                        
+                        double intersection = 0;
+                        for (int k = 0; k < bins1.Length; k++)
+                        {
+                            intersection += Math.Min(bins1[k], bins2[k]);
+                        }
+                        frameSimilarity += intersection; // intersection is already 0-1
+                        channelsComparedThisFrame++;
+                    }
+
+                    if (channelsComparedThisFrame == 3) // Ensure all 3 channels were compared
+                    {
+                        totalSimilarity += (frameSimilarity / 3.0); // Average channel similarities for this frame
+                        validFramesCompared++;
+                    }
+                }
+
+                return validFramesCompared > 0 ? totalSimilarity / validFramesCompared : 0.0;
+            }
+            catch (FormatException ex)
+            {
+                LogerrorMessage($"Error parsing color histogram: {ex.Message}");
+                return 0.0;
+            }
+            catch (Exception ex) // Catch other potential errors during parsing/processing
+            {
+                LogerrorMessage($"Unexpected error in CalculateColorHistogramSimilarity: {ex.Message}");
+                return 0.0;
+            }
+        }
+
+        public double CalculateSimilarityScore(VideoInfo video1, VideoInfo video2)
+        {
+            double simVisualP = CalculatePerceptualHashSimilarity(video1.PerceptualHashes, video2.PerceptualHashes);
+            double simVisualA = CalculateAverageHashSimilarity(video1.AverageHash, video2.AverageHash);
+            double simAudio = CalculateAudioSimilarity(video1.AudioFingerprint, video2.AudioFingerprint);
+            double simColor = CalculateColorHistogramSimilarity(video1.ColorHistogram, video2.ColorHistogram);
+
+            double totalScore = (WEIGHT_VISUAL_PHASH * simVisualP) +
+                                (WEIGHT_VISUAL_AHASH * simVisualA) +
+                                (WEIGHT_AUDIO * simAudio) +
+                                (WEIGHT_COLOR_HISTOGRAM * simColor);
+            return totalScore;
+        }
+        
         private int CalculateHammingDistance(string hash1, string hash2)
         {
             if (hash1.Length != hash2.Length) return int.MaxValue;
@@ -619,7 +1038,8 @@ namespace DOIMAGE
                     if (durationDiff > 2) continue; // 如果时长差异超过2秒，跳过
 
                     // 检查关键帧相似度
-                    if (AreVideosSimilar(video1.Hashes, video2.Hashes))
+                    // if (AreVideosSimilar(video1.PerceptualHashes, video2.PerceptualHashes))
+                    if (CalculateSimilarityScore(video1, video2) >= SIMILARITY_THRESHOLD)
                     {
                         duplicateGroup.Add(video2.Path);
                         processed.Add(video2.Path);
@@ -1891,7 +2311,10 @@ namespace DOIMAGE
             public string FilePath { get; set; }
             public long FileSize { get; set; }
             public TimeSpan Duration { get; set; }
-            public List<string> Hashes { get; set; }
+            public List<string> PerceptualHashes { get; set; }
+            public string AudioFingerprint { get; set; }
+            public string ColorHistogram { get; set; }
+            public string AverageHash { get; set; }
             public DateTime LastModified { get; set; }
         }
 
