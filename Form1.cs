@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -185,6 +185,42 @@ namespace DOIMAGE
             }
             return hashes;
         }
+
+        //private string CalculatePerceptualHash(Image image) // Renamed from CalculatePHash
+        //{
+        //    // 第一步：缩小尺寸
+        //    using (var resized = new Bitmap(image, new Size(32, 32)))
+        //    // 第二步：转换为灰度图
+        //    using (var grayImage = ToGrayscale(resized))
+        //    {
+        //        // 第三步：计算DCT
+        //        double[,] dctValues = ComputeDCT(grayImage);
+
+        //        // 第四步：计算均值（不包括第一个DCT系数）
+        //        double sum = 0;
+        //        for (int y = 0; y < 8; y++)
+        //        {
+        //            for (int x = 0; x < 8; x++)
+        //            {
+        //                if (x == 0 && y == 0) continue; // 跳过第一个系数
+        //                sum += dctValues[x, y];
+        //            }
+        //        }
+        //        double average = sum / 63;
+
+        //        // 第五步：生成哈希值
+        //        var hash = new StringBuilder();
+        //        for (int y = 0; y < 8; y++)
+        //        {
+        //            for (int x = 0; x < 8; x++)
+        //            {
+        //                if (x == 0 && y == 0) continue;
+        //                hash.Append(dctValues[x, y] > average ? "1" : "0");
+        //            }
+        //        }
+        //        return hash.ToString();
+        //    }
+        //}
 
         private string CalculatePerceptualHash(Image image)
         {
@@ -427,13 +463,13 @@ namespace DOIMAGE
 
         private async void btnCheckDuplicates_Click(object sender, EventArgs e)
         {
-           // 加载当前目录的缓存
+            // 加载当前目录的缓存
             LoadVideoCache(txtDirectoryPath.Text);
 
             var videoFiles = GetAllVideoFiles(txtDirectoryPath.Text);
             if (videoFiles.Count == 0)
             {
-                //MessageBox.Show("没有找到视频文件。");
+                // MessageBox.Show("没有找到视频文件。");
                 return;
             }
 
@@ -441,69 +477,71 @@ namespace DOIMAGE
             progressBar.Maximum = videoFiles.Count;
             progressBar.Value = 0;
             lblProgress.Text = "正在分析视频...";
-            
-            int processedCount = 0;
 
-            List<Task<VideoInfo?>> videoInfoTasks = videoFiles.Select(async file =>
+            int processedCount = 0;
+            var semaphore = new SemaphoreSlim(10); // 限制并发数为10
+            var tasks = new List<Task>();
+
+            foreach (var file in videoFiles)
             {
-                VideoInfo? info = null;
-                try
+                await semaphore.WaitAsync();
+
+                var task = Task.Run(async () =>
                 {
-                    info = await GetVideoInfo(file); // GetVideoInfo is already async
-                }
-                catch (Exception ex)
-                {
-                    // Log error for this specific file, prevent it from crashing the whole process
-                    LogerrorMessage($"Error processing file {file} in GetVideoInfo task: {ex.Message}");
-                }
-                finally
-                {
-                    // Thread-safe progress update
-                    int currentProgress = Interlocked.Increment(ref processedCount);
-                    // Ensure UI updates are marshalled to the UI thread
-                    if (this.IsHandleCreated && !this.IsDisposed) 
+                    try
                     {
-                        try
+                        var info = await GetVideoInfo(file);
+                        if (info != null && !string.IsNullOrEmpty(info.Path))
                         {
-                            this.Invoke((Action)(() => {
-                                if (!progressBar.IsDisposed) progressBar.Value = currentProgress;
-                                if (!lblProgress.IsDisposed) lblProgress.Text = $"收集视频信息: {currentProgress}/{videoFiles.Count}";
-                            }));
-                        }
-                        catch (ObjectDisposedException) 
-                        {
-                            // Handle cases where the form or controls might be disposed during async operations
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            // Handle cases where Invoke is called on a disposed handle
+                            lock (videoInfos)
+                            {
+                                videoInfos[info.Path] = info;
+                            }
                         }
                     }
-                }
-                return info; 
-            }).ToList();
+                    catch (Exception ex)
+                    {
+                        LogerrorMessage($"Error processing file {file} in GetVideoInfo task: {ex.Message}");
+                    }
+                    finally
+                    {
+                        int currentProgress = Interlocked.Increment(ref processedCount);
 
-            VideoInfo?[] results = await Task.WhenAll(videoInfoTasks);
+                        if (this.IsHandleCreated && !this.IsDisposed)
+                        {
+                            try
+                            {
+                                this.Invoke((Action)(() =>
+                                {
+                                    if (!progressBar.IsDisposed) progressBar.Value = currentProgress;
+                                    if (!lblProgress.IsDisposed) lblProgress.Text = $"收集视频信息: {currentProgress}/{videoFiles.Count}";
+                                }));
+                            }
+                            catch (ObjectDisposedException) { }
+                            catch (InvalidOperationException) { }
+                        }
 
-            foreach (var infoResult in results)
-            {
-                if (infoResult != null && !string.IsNullOrEmpty(infoResult.Path)) 
-                {
-                    videoInfos[infoResult.Path] = infoResult;
-                }
+                        semaphore.Release();
+                    }
+                });
+
+                tasks.Add(task);
             }
-            
+
+            await Task.WhenAll(tasks);
+
             if (this.IsHandleCreated && !this.IsDisposed)
             {
-                 try
-                 {
-                    this.Invoke((Action)(() => {
-                        if (!progressBar.IsDisposed) progressBar.Value = videoFiles.Count; 
+                try
+                {
+                    this.Invoke((Action)(() =>
+                    {
+                        if (!progressBar.IsDisposed) progressBar.Value = videoFiles.Count;
                         if (!lblProgress.IsDisposed) lblProgress.Text = $"信息收集完成: {processedCount}/{videoFiles.Count}";
                     }));
-                 }
-                 catch (ObjectDisposedException) { /* Ignore if form/controls disposed */ }
-                 catch (InvalidOperationException) { /* Ignore if invoke called on disposed handle */ }
+                }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
             }
 
             // 保存更新后的缓存
@@ -531,7 +569,8 @@ namespace DOIMAGE
             lblProgress.Text = "检测完成。";
         }
 
-        private class VideoInfo
+
+        public class VideoInfo
         {
             public string Path { get; set; }
             public long FileSize { get; set; }
@@ -764,41 +803,7 @@ namespace DOIMAGE
             return Tuple.Create(perceptualHashes, representativeAHash);
         }
 
-        private string CalculatePerceptualHash(Image image) // Renamed from CalculatePHash
-        {
-            // 第一步：缩小尺寸
-            using (var resized = new Bitmap(image, new Size(32, 32)))
-            // 第二步：转换为灰度图
-            using (var grayImage = ToGrayscale(resized))
-            {
-                // 第三步：计算DCT
-                double[,] dctValues = ComputeDCT(grayImage);
 
-                // 第四步：计算均值（不包括第一个DCT系数）
-                double sum = 0;
-                for (int y = 0; y < 8; y++)
-                {
-                    for (int x = 0; x < 8; x++)
-                    {
-                        if (x == 0 && y == 0) continue; // 跳过第一个系数
-                        sum += dctValues[x, y];
-                    }
-                }
-                double average = sum / 63;
-
-                // 第五步：生成哈希值
-                var hash = new StringBuilder();
-                for (int y = 0; y < 8; y++)
-                {
-                    for (int x = 0; x < 8; x++)
-                    {
-                        if (x == 0 && y == 0) continue;
-                        hash.Append(dctValues[x, y] > average ? "1" : "0");
-                    }
-                }
-                return hash.ToString();
-            }
-        }
 
         private double[,] ComputeDCT(Bitmap grayImage)
         {
