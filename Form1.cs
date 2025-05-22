@@ -9,7 +9,7 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Resources;
-using System.Runtime.InteropServices;
+using System.Runtime.InteropServices; // For manual conversion if needed
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,12 +19,100 @@ using Microsoft.VisualBasic.FileIO;
 using System.Text.Json;
 using System.Security.Cryptography;
 using OpenCvSharp; // Added for Mat operations
-using OpenCvSharp.Extensions; // Added for BitmapConverter
+// using OpenCvSharp.Extensions; // Removed as we are adding a manual BitmapToMat
+using System.Drawing.Imaging; // For PixelFormat and BitmapData
+using System.Runtime.InteropServices; // For Marshal.Copy
 
 namespace DOIMAGE
 {
     public partial class Form1 : Form
     {
+        // Static helper method for Bitmap to Mat conversion
+        public static Mat BitmapToMat(Bitmap bitmap)
+        {
+            if (bitmap == null)
+                throw new ArgumentNullException(nameof(bitmap));
+
+            // Lock the bitmap's bits.
+            Rectangle rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            BitmapData bmpData = null;
+            Mat outputMat = null;
+            try
+            {
+                bmpData = bitmap.LockBits(rect, ImageLockMode.ReadOnly, bitmap.PixelFormat);
+
+                // Get the address of the first line.
+                IntPtr ptr = bmpData.Scan0;
+
+                // Calculate the total bytes.
+                int bytes = Math.Abs(bmpData.Stride) * bitmap.Height;
+                
+
+                MatType matType;
+                switch (bitmap.PixelFormat)
+                {
+                    case PixelFormat.Format8bppIndexed:
+                        matType = MatType.CV_8UC1;
+                        // For indexed, a direct copy might not be what's expected.
+                        // Often, indexed images are converted to BGR or BGRA first.
+                        // However, if the intent is to treat the indexed values as grayscale, this is okay.
+                        // If the palette matters, a more complex conversion is needed.
+                        // For robustness, one might convert to Format24bppRgb or Format32bppArgb first.
+                        // This example proceeds with direct copy, assuming grayscale interpretation of indexed values.
+                        break;
+                    case PixelFormat.Format24bppRgb:
+                        matType = MatType.CV_8UC3;
+                        break;
+                    case PixelFormat.Format32bppArgb:
+                    case PixelFormat.Format32bppRgb: // Treat 32bppRGB as ARGB (alpha might be ignored or be FF)
+                        matType = MatType.CV_8UC4;
+                        break;
+                    default:
+                        // Fallback: Convert to a known format (e.g., 24bppRgb or 32bppArgb) then re-process.
+                        // This is a simplified example; a production system might handle this more gracefully.
+                        using (Bitmap tempBitmap = new Bitmap(bitmap.Width, bitmap.Height, PixelFormat.Format24bppRgb))
+                        {
+                            using (Graphics g = Graphics.FromImage(tempBitmap))
+                            {
+                                g.DrawImage(bitmap, new Rectangle(0, 0, tempBitmap.Width, tempBitmap.Height));
+                            }
+                            // Recursively call, but be careful about stack overflow if conversion always fails.
+                            // Better to have a limited set of target formats.
+                            // For this example, we'll just throw if not directly supported.
+                            throw new NotSupportedException($"Pixel format {bitmap.PixelFormat} not directly supported. Consider converting to 24bppRgb or 32bppArgb first.");
+                        }
+                }
+                
+                // Create an empty Mat of the correct dimensions and type.
+                outputMat = new Mat(bitmap.Height, bitmap.Width, matType);
+                // Copy the data from the Bitmap to the Mat.
+                // The Mat's data pointer (outputMat.Data) is where the image data should be copied.
+                // Marshal.Copy from IntPtr (bmpData.Scan0) to Mat.Data.
+                // This requires careful handling of Mat's lifetime if it's wrapping external data.
+                // The provided solution implies creating a Mat and copying data into it.
+
+                // Create a managed byte array
+                byte[] rgbValues = new byte[bytes];
+                // Copy the RGB values from the bitmap to the managed array.
+                System.Runtime.InteropServices.Marshal.Copy(ptr, rgbValues, 0, bytes);
+                // Copy from the managed array to the Mat's data.
+                System.Runtime.InteropServices.Marshal.Copy(rgbValues, 0, outputMat.Data, bytes);
+
+                return outputMat;
+            }
+            catch
+            {
+                outputMat?.Dispose(); // Ensure Mat is disposed if an error occurs after its creation
+                throw;
+            }
+            finally
+            {
+                if (bmpData != null)
+                    bitmap.UnlockBits(bmpData);
+            }
+        }
+
+
         private const double WEIGHT_VISUAL_PHASH = 0.4;
         private const double WEIGHT_VISUAL_AHASH = 0.2;
         private const double WEIGHT_AUDIO = 0.3;
@@ -189,7 +277,7 @@ namespace DOIMAGE
             {
                 LogerrorMessage($"提取关键帧失败: {videoPath}: {ex.Message}");
             }
-            return hashes; // This will be List<ulong> eventually
+            return hashes;
         }
 
         private ulong CalculatePerceptualHash(Image image)
@@ -197,7 +285,8 @@ namespace DOIMAGE
             if (image == null) throw new ArgumentNullException(nameof(image));
 
             using (Bitmap bmp = new Bitmap(image))
-            using (Mat mat = BitmapConverter.ToMat(bmp))
+            // Using the new static helper method
+            using (Mat mat = Form1.BitmapToMat(bmp))
             {
                 if (mat.Empty()) throw new VideoProcessingException("Converted Mat is empty.");
 
@@ -210,13 +299,13 @@ namespace DOIMAGE
                 using (grayMat)
                 {
                     Mat resized = new Mat();
-                    Cv2.Resize(grayMat, resized, new Size(32, 32), 0, 0, InterpolationFlags.Linear);
+                    Cv2.Resize(grayMat, resized, new OpenCvSharp.Size(32, 32), 0, 0, InterpolationFlags.Linear); // Qualified
 
                     Mat resizedFloat = new Mat();
                     resized.ConvertTo(resizedFloat, MatType.CV_32F);
 
                     Mat dctResult = new Mat();
-                    Cv2.Dct(resizedFloat, dctResult, DctFlags.Forward);
+                    Cv2.Dct(resizedFloat, dctResult, DctFlags.None); // Corrected DctFlags.Forward to DctFlags.None
 
                     Mat dctRoi = new Mat(dctResult, new Rect(0, 0, 8, 8));
 
@@ -432,7 +521,7 @@ namespace DOIMAGE
         {
             if (image == null) throw new ArgumentNullException(nameof(image));
 
-            using (var resized = new Bitmap(image, new Size(8, 8)))
+            using (var resized = new Bitmap(image, new System.Drawing.Size(8, 8))) // Qualified
             using (var grayImage = ToGrayscale(resized)) // ToGrayscale is already defined in Form1
             {
                 long totalBrightness = 0;
@@ -490,7 +579,15 @@ namespace DOIMAGE
                 distance += (int)(xorResult & 1);
                 xorResult >>= 1;
             }
-            return distance;
+            // This method should operate on ulongs
+            ulong xorResult = hash1 ^ hash2;
+            int dist = 0;
+            while (xorResult > 0)
+            {
+                dist += (int)(xorResult & 1);
+                xorResult >>= 1;
+            }
+            return dist;
         }
 
         private async void btnCheckDuplicates_Click(object sender, EventArgs e)
@@ -728,11 +825,12 @@ namespace DOIMAGE
                 };
 
                 var visualFeatures = await ExtractFrameHashes(videoPath, 5);
-                info.PerceptualHashes = visualFeatures.Item1;
-                info.AverageHash = visualFeatures.Item2;
-                if (info.PerceptualHashes == null) info.PerceptualHashes = new List<string>(); // Defensive
-                if (info.AverageHash == null) info.AverageHash = string.Empty; // Defensive
-
+                info.PerceptualHashes = visualFeatures.Item1; // Item1 is List<ulong>
+                info.AverageHash = visualFeatures.Item2;      // Item2 is ulong
+                
+                // Defensive initialization for lists, ensure correct type
+                if (info.PerceptualHashes == null) info.PerceptualHashes = new List<ulong>();
+                // AverageHash is ulong, default is 0, no need for null check like string.Empty
 
                 // 更新缓存
                 videoCache[videoPath] = new VideoCache
@@ -755,6 +853,65 @@ namespace DOIMAGE
                 return null;
             }
         }
+
+        // This ExtractKeyFrameHashes is the one that needs to change its internal list and return type
+        private async Task<List<ulong>> ExtractKeyFrameHashes(string videoPath, int frameCount) // Changed return type
+        {
+            var hashes = new List<ulong>(); // Changed to List<ulong>
+            try
+            {
+                var inputFile = new MediaFile(videoPath);
+                var ffmpeg = new Engine(Path.Combine(Application.StartupPath, "ffmpeg.exe"));
+                var metadata = await GetMetaDataWithTimeout(ffmpeg, inputFile, 3000);
+                if (metadata == null) return hashes;
+
+                double totalSeconds = metadata.Duration.TotalSeconds;
+                var random = new Random();
+                var samplePoints = new List<int>();
+                double startTime = Math.Min(totalSeconds * 0.1, 10); 
+                double endTime = Math.Max(totalSeconds * 0.9, totalSeconds - 10); 
+
+                if (endTime - startTime > frameCount)
+                {
+                    double interval = (endTime - startTime) / (frameCount + 1);
+                    for (int i = 0; i < frameCount; i++)
+                    {
+                        double baseTime = startTime + interval * (i + 1);
+                        int second = (int)(baseTime + random.NextDouble() * interval * 0.5);
+                        second = Math.Max((int)startTime, Math.Min(second, (int)endTime));
+                        samplePoints.Add(second);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < Math.Min(frameCount, (int)totalSeconds); i++)
+                    {
+                        samplePoints.Add(i);
+                    }
+                }
+
+                foreach (var second in samplePoints)
+                {
+                    var options = new ConversionOptions { Seek = TimeSpan.FromSeconds(second) };
+                    var tempFile = Path.GetTempFileName() + ".jpg";
+                    var outputFile = new MediaFile(tempFile);
+                    await ffmpeg.GetThumbnailAsync(inputFile, outputFile, options);
+
+                    using (var image = Image.FromFile(tempFile))
+                    {
+                        ulong pHash = CalculatePerceptualHash(image);
+                        hashes.Add(pHash); // Add ulong directly
+                    }
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogerrorMessage($"提取关键帧失败 {videoPath}: {ex.Message}");
+            }
+            return hashes;
+        }
+
 
         private async Task<Tuple<List<ulong>, ulong>> ExtractFrameHashes(string videoPath, int frameCount) // Return types changed
         {
@@ -1647,7 +1804,7 @@ namespace DOIMAGE
                 // 将图像缩小到原来的30%
                 int newWidth = (int)(imgWidth * 0.3);
                 int newHeight = (int)(imgHeight * 0.3);
-                Bitmap resizedBitmap = new Bitmap(joinedBitmap, new Size(newWidth, newHeight));
+                Bitmap resizedBitmap = new Bitmap(joinedBitmap, new System.Drawing.Size(newWidth, newHeight)); // Qualified
 
                 // 保存缩小后的图像
                 resizedBitmap.Save(outputFilePath);
@@ -1919,7 +2076,7 @@ namespace DOIMAGE
                 {
                     FormBorderStyle = FormBorderStyle.None, // 无边框
                     StartPosition = FormStartPosition.CenterScreen, // 屏幕中央
-                    Size = image.Size // 设置窗口大小为图片大小
+                    Size = new System.Drawing.Size(image.Width, image.Height) // Qualified (image.Size is already System.Drawing.Size)
                 };
 
                 // 创建一个 PictureBox 并将图片设置为其图像
