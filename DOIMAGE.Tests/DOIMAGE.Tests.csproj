@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework> <!-- Assuming DOIMAGE project targets net8.0 -->
+    <TargetFramework>net8.0-windows7.0</TargetFramework> <!-- Changed to match main project -->
     <IsPackable>false</IsPackable>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
