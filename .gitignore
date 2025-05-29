@@ -1,0 +1,10 @@
+# Ignore large files
+bin/Debug/net8.0-windows7.0/ffmpeg.exe
+bin/Debug/net8.0-windows7.0/新版ffmpeg.rar
+
+# Ignore build artifacts
+bin/
+obj/
+
+# Visual Studio files
+.vs/
