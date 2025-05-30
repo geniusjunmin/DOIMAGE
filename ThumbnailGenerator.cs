@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Drawing.Imaging;
 using System.Threading.Tasks;
 using FFmpeg.NET;
 
@@ -67,7 +68,7 @@ namespace DOIMAGE
             }
         }
 
-        public async Task GetImgCapAsync(string inputName)
+        public async Task GetImgCapAsync(string inputName, int quality = 75)
         {
             if (File.Exists(inputName + ".jpg"))
             {
@@ -121,12 +122,18 @@ namespace DOIMAGE
                     int randomSecond = random.Next(i * segmentDuration, Math.Min((i + 1) * segmentDuration, (int)totalSeconds -1));
                     if (randomSecond <0) randomSecond =0; // ensure positive seek time
 
-                    var options = new ConversionOptions { Seek = TimeSpan.FromSeconds(randomSecond) };
+                    // Convert quality from 10-100 range to FFmpeg's 1-31 range (1=best)
+                    int ffmpegQuality = 31 - (int)((quality - 1) * 0.34);
+                    ffmpegQuality = Math.Clamp(ffmpegQuality, 1, 31);
+                    var options = new ConversionOptions { 
+                        Seek = TimeSpan.FromSeconds(randomSecond),
+                        VideoBitRate = ffmpegQuality // Using VideoBitRate to control quality
+                    };
                     var outputFile = new MediaFile(inputName + "_img_" + (i + 1).ToString() + ".jpg");
                     await ffmpeg.GetThumbnailAsync(inputFile, outputFile, options);
                 }
 
-                await GetJiugonggeAsync(inputName); // Make this awaitable
+                await GetJiugonggeAsync(inputName, quality); // Pass quality parameter
                 LogMessage($"合并截图完成: {inputName}");
             }
             catch (Exception ex)
@@ -135,7 +142,7 @@ namespace DOIMAGE
             }
         }
 
-        public async Task GetJiugonggeAsync(string inputName) // Changed to async Task
+        public async Task GetJiugonggeAsync(string inputName, int quality = 75) // Added quality parameter
         {
             try
             {
@@ -174,8 +181,12 @@ namespace DOIMAGE
                 }
 
                 string outputFilePath = inputName + ".jpg";
-                int newWidth = (int)(imgWidth * 0.3);
-                int newHeight = (int)(imgHeight * 0.3);
+                // Calculate scale factor based on quality (10-100 maps to 0.2-1.0)
+                float scaleFactor = 0.1f + (quality - 1) * 0.008888f;
+                scaleFactor = Math.Clamp(scaleFactor, 0.1f, 1.0f);
+                
+                int newWidth = (int)(imgWidth * scaleFactor);
+                int newHeight = (int)(imgHeight * scaleFactor);
                 if (newWidth <=0 || newHeight <=0) {
                     LogerrorMessage($"计算得到的缩放后尺寸无效 ({newWidth}x{newHeight}) for {inputName}. 使用原始尺寸.");
                     newWidth = imgWidth;
@@ -184,7 +195,16 @@ namespace DOIMAGE
 
                 using (Bitmap resizedBitmap = new Bitmap(joinedBitmap, new Size(newWidth, newHeight)))
                 {
-                    resizedBitmap.Save(outputFilePath);
+                    // Get JPEG encoder and set quality
+                    ImageCodecInfo jpgEncoder = ImageCodecInfo.GetImageEncoders()
+                        .First(codec => codec.FormatID == ImageFormat.Jpeg.Guid);
+                    
+                    EncoderParameters encoderParams = new EncoderParameters(1);
+                    // Reduce quality further by using 70% of slider value (10-100 -> 7-70)
+                    int jpegQuality = (int)(quality * 0.7);
+                    encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, jpegQuality);
+                    
+                    resizedBitmap.Save(outputFilePath, jpgEncoder, encoderParams);
                 }
                 
                 joinedBitmap.Dispose();
@@ -330,4 +350,4 @@ namespace DOIMAGE
             LogMessage("缩略图处理完成。");
         }
     }
-} 
+}

@@ -81,6 +81,8 @@ namespace DOIMAGE
                             new TreeViewEventArgs(nodeToSelect));
                     }
                 }
+                UpdateJpgTotalSize();
+
             }
             catch (UnauthorizedAccessException ex)
             {
@@ -438,16 +440,71 @@ namespace DOIMAGE
                 return;
             }
 
-            if (Directory.Exists(txtDirectoryPath.Text))
+            if (!Directory.Exists(txtDirectoryPath.Text))
             {
-                DirectoryInfo dir = new DirectoryInfo(txtDirectoryPath.Text);
-                await _thumbnailGenerator.ProcessDirectoryAsync(txtDirectoryPath.Text, UpdateThumbnailProgress, false);
+                LogMessage("目录不存在。");
+                return;
+            }
+
+            try
+            {
+                btnGenerateImage.Enabled = false;
+                progressBar.Value = 0;
+                lblProgress.Text = "正在生成图片...";
+
+                var videoFiles = GetAllVideoFiles(txtDirectoryPath.Text);
+                if (videoFiles.Count == 0)
+                {
+                    LogMessage("没有找到可处理的视频文件。");
+                    return;
+                }
+
+                progressBar.Maximum = videoFiles.Count;
+                int processedCount = 0;
+                var semaphore = new SemaphoreSlim(10); // 控制最大并发数为10
+                var tasks = new List<Task>();
+
+                // 在主线程获取质量值
+                int quality = trackBarQuality.Value;
+                
+                foreach (var file in videoFiles)
+                {
+                    await semaphore.WaitAsync();
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _thumbnailGenerator.GetImgCapAsync(file, quality);
+
+                            int currentProgress = Interlocked.Increment(ref processedCount);
+                            this.Invoke((Action)(() =>
+                            {
+                                progressBar.Value = currentProgress;
+                                lblProgress.Text = $"处理进度: {currentProgress}/{videoFiles.Count}";
+                            }));
+                        }
+                        catch (Exception ex)
+                        {
+                            LogerrorMessage($"处理文件{file}时出错: {ex.Message}");
+                        }
+                        finally
+                        {
+                            semaphore.Release();
+                        }
+                    }));
+                }
+
+                await Task.WhenAll(tasks);
                 LogMessage("处理完成。");
                 LoadFileSystem(); // 重新加载文件系统，实时更新
             }
-            else
+            catch (Exception ex)
             {
-                LogMessage("目录不存在。");
+                LogerrorMessage($"生成图片出错: {ex.Message}");
+            }
+            finally
+            {
+                btnGenerateImage.Enabled = true;
             }
         }
 
@@ -538,7 +595,7 @@ namespace DOIMAGE
                     {
                         LogerrorMessage($"删除时出错: {ex.Message}");
                     }
-                    await _thumbnailGenerator.GetImgCapAsync(selectedFilePath);
+                    await _thumbnailGenerator.GetImgCapAsync(selectedFilePath, trackBarQuality.Value);
                     try
                     {
                         LoadImageWithoutLock(jpgFile);
@@ -553,7 +610,7 @@ namespace DOIMAGE
                 {
                     if (!Directory.Exists(selectedFilePath))
                     {
-                        await _thumbnailGenerator.GetImgCapAsync(selectedFilePath);
+                        await _thumbnailGenerator.GetImgCapAsync(selectedFilePath, trackBarQuality.Value);
                         try
                         {
                             LoadImageWithoutLock(jpgFile);
@@ -693,52 +750,42 @@ namespace DOIMAGE
 
         public void showimg()
         {
-            //在屏幕正中间弹出一张base64图片
-            string base64Str = "/";
-
-            if (radioButton2.Checked)
+            try 
             {
-                base64Str = "/";
+                string url = "http://www.junhoo.net";
+                if (radioButton2.Checked) 
+                {
+                    url = "http://www.junhoo.net/en"; // 英文版网站
+                }
+                
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
             }
-
-            // 将 Base64 字符串转换为字节数组
-            byte[] imageBytes = Convert.FromBase64String(base64Str);
-
-            // 使用字节数组创建图片
-            using (MemoryStream ms = new MemoryStream(imageBytes))
+            catch (Exception ex)
             {
-                Image image = Image.FromStream(ms);
-
-                // 创建一个新的 Form 来显示图片
-                Form imageForm = new Form
-                {
-                    FormBorderStyle = FormBorderStyle.None, // 无边框
-                    StartPosition = FormStartPosition.CenterScreen, // 屏幕中央
-                    Size = image.Size // 设置窗口大小为图片大小
-                };
-
-                // 创建一个 PictureBox 并将图片设置为其图像
-                PictureBox pictureBox = new PictureBox
-                {
-                    Dock = DockStyle.Fill,
-                    Image = image,
-                    SizeMode = PictureBoxSizeMode.Zoom // 自动调整图片大小
-                };
-                // 为 PictureBox 添加点击事件，点击时关闭图片窗口
-                pictureBox.Click += (s, ev) => imageForm.Close();
-                // 将 PictureBox 添加到 Form 中
-                imageForm.Controls.Add(pictureBox);
-
-                // 显示图片 Form
-                imageForm.ShowDialog();
+                LogerrorMessage($"打开技术支持网站失败: {ex.Message}");
+                MessageBox.Show("无法打开技术支持网站，请检查网络连接", 
+                    "错误", 
+                    MessageBoxButtons.OK, 
+                    MessageBoxIcon.Error);
             }
         }
         #endregion
 
         Label supportLabel = new Label();
 
+        private void trackBarQuality_ValueChanged(object sender, EventArgs e)
+        {
+            lblQuality.Text = $"质量: {trackBarQuality.Value}%";
+        }
+
         private async void Form1_Load(object sender, EventArgs e)
         {
+            // 初始化质量滑块显示
+            lblQuality.Text = $"质量: {trackBarQuality.Value}%";
             // 创建 Label
             supportLabel.Text = "技术支持: JunHoo";
             supportLabel.AutoSize = true;
@@ -770,18 +817,52 @@ namespace DOIMAGE
             lblProgress.BackColor = Color.Transparent; // 设置 Label 的背景为透明
             lblProgress.BringToFront();
 
+            // 恢复控件状态
+            if (File.Exists("settings.ini"))
+            {
+                try
+                {
+                    var settings = File.ReadAllLines("settings.ini");
+                    if (settings.Length == 0)
+                    {
+                        var culture = System.Globalization.CultureInfo.CurrentCulture.Name;
+
+                        if (culture == "zh-CN" && !radioButton1.Checked)
+                        {
+                            radioButton1.Checked = true;
+                        }
+                        else if (culture != "zh-CN" && !radioButton2.Checked)
+                        {
+                            radioButton2.Checked = true;
+                        }
+
+                    }
+                    foreach (var line in settings)
+                    {
+                        if (line.StartsWith("Quality="))
+                        {
+                            int quality = int.Parse(line.Substring("Quality=".Length));
+                            trackBarQuality.Value = quality;
+                            lblQuality.Text = $"质量: {quality}%";
+                        }
+                        else if (line.StartsWith("Language="))
+                        {
+                            string lang = line.Substring("Language=".Length);
+                            radioButton1.Checked = (lang == "zh-CN");
+                            radioButton2.Checked = (lang == "en-US");
+                        }
+                    }
+                 
+                }
+                catch (Exception ex)
+                {
+                    LogerrorMessage($"读取设置时出错: {ex.Message}");
+                }
+            }
+      
             await GetUpdateCfgAsync();
 
-            var culture = System.Globalization.CultureInfo.CurrentCulture.Name;
 
-            if (culture == "zh-CN")
-            {
-                radioButton1.Checked = true;
-            }
-            else
-            {
-                radioButton2.Checked = true;
-            }
         }
 
         private void TreeViewFiles_DrawNode(object sender, DrawTreeNodeEventArgs e)
@@ -1008,6 +1089,32 @@ namespace DOIMAGE
                 await _thumbnailGenerator.ProcessDirectoryAsync(txtDirectoryPath.Text, UpdateThumbnailProgress, true);
                 LogMessage("处理完成。");
                 LoadFileSystem(); // 重新加载文件系统，实时更新
+           
+            }
+        }
+
+        private void UpdateJpgTotalSize()
+        {
+            try
+            {
+                if (!Directory.Exists(txtDirectoryPath.Text))
+                {
+                    txtLog.AppendText("目录不存在，无法计算jpg文件大小\n");
+                    return;
+                }
+
+                long totalBytes = 0;
+                foreach (var file in Directory.EnumerateFiles(txtDirectoryPath.Text, "*.jpg", System.IO. SearchOption.AllDirectories))
+                {
+                    totalBytes += new FileInfo(file).Length;
+                }
+
+                txtLog.AppendText($"当前目录jpg文件总大小: {FormatFileSize(totalBytes)}\n");
+                lab_imagesize.Text = FormatFileSize(totalBytes);
+            }
+            catch (Exception ex)
+            {
+                LogerrorMessage($"计算jpg文件总大小时出错: {ex.Message}");
             }
         }
 
@@ -1015,6 +1122,12 @@ namespace DOIMAGE
         {
             SaveVideoCache();
             File.WriteAllText("lastDirectoryPath.txt", txtDirectoryPath.Text);
+            
+            // 保存控件状态到配置文件
+            var settings = new StringBuilder();
+            settings.AppendLine($"Quality={trackBarQuality.Value}");
+            settings.AppendLine($"Language={(radioButton1.Checked ? "zh-CN" : "en-US")}");
+            File.WriteAllText("settings.ini", settings.ToString());
         }
 
         private void treeViewFiles_MouseDoubleClick(object sender, MouseEventArgs e)
@@ -1275,28 +1388,5 @@ namespace DOIMAGE
 
             return directoryNode;
         }
-    }
-
-    public class VideoInfo
-    {
-        public string Path { get; set; }
-        public long FileSize { get; set; }
-        public TimeSpan Duration { get; set; }
-        public List<string> PerceptualHashes { get; set; } = new List<string>();
-        public string AudioFingerprint { get; set; } = string.Empty;
-        public string ColorHistogram { get; set; } = string.Empty;
-        public string AverageHash { get; set; } = string.Empty;
-    }
-
-    public class VideoCache
-    {
-        public string FilePath { get; set; }
-        public long FileSize { get; set; }
-        public TimeSpan Duration { get; set; }
-        public List<string> PerceptualHashes { get; set; }
-        public string AudioFingerprint { get; set; }
-        public string ColorHistogram { get; set; }
-        public string AverageHash { get; set; }
-        public DateTime LastModified { get; set; }
     }
 }
