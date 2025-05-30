@@ -1,20 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace DOIMAGE
 {
     public class VideoCache
     {
-        public string FilePath { get; set; }
+        public string FilePath { get; set; } = string.Empty;
         public long FileSize { get; set; }
         public TimeSpan Duration { get; set; }
-        public List<string> PerceptualHashes { get; set; }
-        public string AudioFingerprint { get; set; }
-        public string ColorHistogram { get; set; }
-        public string AverageHash { get; set; }
+        public List<string> PerceptualHashes { get; set; } = new List<string>();
+        public string AudioFingerprint { get; set; } = string.Empty;
+        public string ColorHistogram { get; set; } = string.Empty;
+        public string AverageHash { get; set; } = string.Empty;
         public DateTime LastModified { get; set; }
     }
 }

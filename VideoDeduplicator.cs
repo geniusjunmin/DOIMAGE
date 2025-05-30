@@ -43,7 +43,7 @@ namespace DOIMAGE
                     double durationDiff = Math.Abs(videos[i].Duration.TotalSeconds - videos[j].Duration.TotalSeconds);
                     if (durationDiff > 2) continue;
                     
-                    if (await AreVideosSimilar(videos[i], videos[j]))
+                    if (await AreVideosSimilar(videos[i].Path, videos[j].Path))
                     {
                         duplicateGroup.Add(videos[j].Path);
                         processed.Add(videos[j].Path);
@@ -61,7 +61,7 @@ namespace DOIMAGE
             return duplicates;
         }
 
-        public async Task<bool> AreVideosSimilar(VideoInfo video1, VideoInfo video2)
+        public bool AreVideosSimilar(VideoInfo video1, VideoInfo video2)
         {
             // 优先检查AverageHash (完全匹配)
             if (!string.IsNullOrEmpty(video1.AverageHash) && 
